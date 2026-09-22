@@ -46,10 +46,13 @@ Action: Finish[the answer]
 The whole "agent" is just:
 
 1. Send the transcript so far to the LLM.
-2. Regex out `Action: (\w+)\[(.*)\]` and the preceding `Thought:`.
+2. Find the first `Action: Name[` and scan to its matching `]` (depth-
+   aware, so an input containing brackets survives), plus the preceding
+   `Thought:`.
 3. If `Finish` → return the answer. If a real tool → call it, append
    `Observation: <result>` to the transcript. If unknown → tell the
-   model so it can recover.
+   model so it can recover. If nothing parsed → re-prompt with the
+   required format, up to `max_parse_retries` times in a row.
 4. Go to 1, up to `max_steps`.
 
 That's the entire pattern — the "reasoning" is just the model's free
@@ -68,7 +71,8 @@ text; the "acting" is a string match plus a Python function call.
   `AnthropicLLM.__call__`) to see how cost scales with step count —
   relevant once you're chaining agents for a real travel/tourism use
   case with many tool calls per query.
-- **Add a "no valid action" recovery step**: right now, if the model's
-  output doesn't parse, the agent just stops. A more robust version
-  would re-prompt with "Your last response didn't match the required
-  format, please retry" instead of giving up.
+- **Tighten the retry budget**: unparseable output now triggers a
+  re-prompt (`max_parse_retries`, default 2), but a retry burns a step
+  from the same `max_steps` budget as real tool calls. Whether a
+  formatting stumble should cost as much as a tool call is a judgement
+  call worth playing with.

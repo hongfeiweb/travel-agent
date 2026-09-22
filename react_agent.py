@@ -16,10 +16,13 @@ transcript that gets fed back into the LLM on every step:
 
 There's no framework here — just:
   1. A prompt template that teaches the model this format.
-  2. A regex-based parser that pulls "Action: Name[input]" out of the
-     model's text.
+  2. A parser that pulls the first "Action: Name[input]" out of the
+     model's text, matching brackets by depth so a bracketed input
+     doesn't get confused with the end of the action.
   3. A loop that: calls the LLM -> parses the action -> runs the tool
      -> appends the observation -> repeats, until Finish or a step cap.
+     Output that doesn't parse gets re-prompted rather than ending the
+     run.
 
 Two LLM backends are included:
   - AnthropicLLM: calls the real Claude API (needs ANTHROPIC_API_KEY).
@@ -72,7 +75,7 @@ def build_system_prompt(tool_descriptions: Dict[str, str]) -> str:
 # Parsing
 # ---------------------------------------------------------------------------
 
-ACTION_RE = re.compile(r"Action:\s*(\w+)\[(.*)\]", re.DOTALL)
+ACTION_HEAD_RE = re.compile(r"Action:\s*(\w+)\[")
 
 
 @dataclass
@@ -83,18 +86,48 @@ class ParsedStep:
     raw_text: str
 
 
+def _extract_bracketed(text: str, open_idx: int) -> Optional[str]:
+    """
+    Return the contents of the bracket that opens at text[open_idx].
+
+    Scans forward tracking nesting depth rather than regex-matching, so
+    that both of these parse the way a reader expects:
+
+        Search[list[0] stuff]     -> "list[0] stuff"
+        Calculator[1+1] followed
+        by a second Action line   -> "1+1", not everything up to the
+                                     final ']' in the whole response
+
+    A greedy regex gets the first right and the second wrong; a non-greedy
+    one gets the second right and the first wrong. Returns None if the
+    bracket is never closed (e.g. a response truncated mid-action), which
+    the caller treats as a parse failure rather than guessing at the
+    intended input.
+    """
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : i]
+    return None
+
+
 def parse_step(text: str) -> ParsedStep:
     """Pull the Thought and the first Action[...] out of model output."""
     thought_match = re.search(r"Thought:\s*(.*?)(?:\nAction:|\Z)", text, re.DOTALL)
     thought = thought_match.group(1).strip() if thought_match else None
 
-    action_match = ACTION_RE.search(text)
-    if action_match:
-        action_name = action_match.group(1).strip()
-        action_input = action_match.group(2).strip()
-    else:
-        action_name = None
-        action_input = None
+    action_name = None
+    action_input = None
+    head = ACTION_HEAD_RE.search(text)
+    if head:
+        inner = _extract_bracketed(text, head.end() - 1)
+        if inner is not None:
+            action_name = head.group(1)
+            action_input = inner.strip()
 
     return ParsedStep(thought=thought, action_name=action_name, action_input=action_input, raw_text=text)
 
@@ -169,17 +202,23 @@ class ReActAgent:
         tools: Dict[str, Callable[[str], str]],
         tool_descriptions: Dict[str, str],
         max_steps: int = 6,
+        max_parse_retries: int = 2,
         verbose: bool = True,
     ):
         self.llm = llm
         self.tools = tools
         self.system_prompt = build_system_prompt(tool_descriptions)
         self.max_steps = max_steps
+        # Consecutive unparseable responses tolerated before giving up. Each
+        # retry still costs a step, so max_steps stays the hard cap on LLM
+        # calls. 0 restores the old behaviour of bailing on first failure.
+        self.max_parse_retries = max_parse_retries
         self.verbose = verbose
 
     def run(self, question: str) -> ReActResult:
         messages = [{"role": "user", "content": f"Question: {question}"}]
         trace: List[TraceStep] = []
+        consecutive_parse_failures = 0
 
         for step_num in range(1, self.max_steps + 1):
             raw = self.llm(self.system_prompt, messages)
@@ -196,9 +235,29 @@ class ReActAgent:
             messages.append({"role": "assistant", "content": raw})
 
             if parsed.action_name is None:
-                # Model didn't follow the format — stop rather than loop blindly.
-                trace.append(TraceStep(parsed.thought, None, None, None))
-                return ReActResult(answer=None, trace=trace)
+                # Model didn't follow the format. Tell it so and let it retry,
+                # rather than throwing away a run over one malformed turn.
+                consecutive_parse_failures += 1
+                if consecutive_parse_failures > self.max_parse_retries:
+                    if self.verbose:
+                        print("No valid action after "
+                              f"{self.max_parse_retries} retries — giving up.")
+                    trace.append(TraceStep(parsed.thought, None, None, None))
+                    return ReActResult(answer=None, trace=trace)
+
+                reprompt = (
+                    "Your last response did not contain a valid action. Reply with "
+                    "a single Thought line followed by a single Action line of the "
+                    "form 'Action: ToolName[input]', or 'Action: Finish[your answer]' "
+                    f"if you are done. Available tools: {list(self.tools)}."
+                )
+                if self.verbose:
+                    print(f"Observation: {reprompt}")
+                trace.append(TraceStep(parsed.thought, None, None, reprompt))
+                messages.append({"role": "user", "content": reprompt})
+                continue
+
+            consecutive_parse_failures = 0
 
             if parsed.action_name == "Finish":
                 trace.append(TraceStep(parsed.thought, "Finish", parsed.action_input, None))
