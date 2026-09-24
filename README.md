@@ -26,6 +26,31 @@ export ANTHROPIC_API_KEY=sk-ant-...
 python3 run_live.py "How many years passed between Cézanne's birth and Van Gogh's time in Arles?"
 ```
 
+## Memory modes and token usage
+
+The agent supports three context strategies for controlling prompt size and cost. Use the single canonical option `memory_mode`:
+
+- `full`: keeps the original behavior with the entire transcript in the prompt.
+- `compact`: keeps a short memory plus the most recent turns.
+- `summary`: keeps a short memory plus a brief history summary and the most recent turns.
+
+This is configured through `ReActAgent(..., memory_mode="summary")`.
+
+The default is `summary`, which is the best balance for most small tool-using agents.
+
+`memory_mode` is the only supported configuration knob for this behavior; the old compact-memory flag was removed to keep the API explicit and unambiguous.
+
+```python
+agent = ReActAgent(
+    llm=llm,
+    tools=TOOLS,
+    tool_descriptions=TOOL_DESCRIPTIONS,
+    memory_mode="summary",
+)
+```
+
+The point is to preserve just enough context for the model to reason correctly while avoiding the unbounded token growth that happens when every tool result is appended forever to the prompt.
+
 ## How the loop works
 
 Every step, the running transcript looks like:
@@ -58,6 +83,10 @@ The whole "agent" is just:
 That's the entire pattern — the "reasoning" is just the model's free
 text; the "acting" is a string match plus a Python function call.
 
+The memory mode does not change the core ReAct loop. It only changes what
+information gets sent back to the model on the next turn, so you can trade
+off between richer context and lower token cost.
+
 ## Things worth experimenting with next
 
 - **Swap `Search` for a real API** (web search, Wikipedia, a vector
@@ -76,3 +105,5 @@ text; the "acting" is a string match plus a Python function call.
   from the same `max_steps` budget as real tool calls. Whether a
   formatting stumble should cost as much as a tool call is a judgement
   call worth playing with.
+- **Tune memory mode**: if you want maximum determinism, use `full`; if
+  you want lower cost, prefer `compact` or `summary`.

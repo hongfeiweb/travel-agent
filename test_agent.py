@@ -138,6 +138,53 @@ def test_parse_failure_counter_resets_on_a_good_turn():
     print("[PASS] test_parse_failure_counter_resets_on_a_good_turn")
 
 
+def test_compact_memory_keeps_prompt_short():
+    calls = []
+
+    def tracking_llm(system, messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "Thought: I need to do a search.\nAction: Search[van gogh arles]"
+        if len(calls) == 2:
+            return "Thought: I now know the final answer\nAction: Finish[Van Gogh lived in Arles from 1888 to 1889.]"
+        raise AssertionError("unexpected extra LLM call")
+
+    agent = ReActAgent(
+        llm=tracking_llm,
+        tools=TOOLS,
+        tool_descriptions=TOOL_DESCRIPTIONS,
+        max_steps=3,
+        max_parse_retries=0,
+        memory_mode="compact",
+        verbose=False,
+    )
+    result = agent.run("Where did Van Gogh live?")
+
+    assert result.answer == "Van Gogh lived in Arles from 1888 to 1889."
+    assert len(calls[0]) == 1, f"initial prompt should be compact, got {calls[0]}"
+    assert "Memory:" in calls[0][0]["content"]
+    assert "Recent steps:" in calls[0][0]["content"]
+    print("[PASS] test_compact_memory_keeps_prompt_short")
+
+
+def test_summary_memory_mode_works():
+    scripted = [
+        "Thought: I should search the answer.\nAction: Search[van gogh arles]",
+        "Thought: I now know the final answer\nAction: Finish[Van Gogh lived in Arles from 1888 to 1889.]",
+    ]
+    agent = ReActAgent(
+        llm=MockLLM(scripted),
+        tools=TOOLS,
+        tool_descriptions=TOOL_DESCRIPTIONS,
+        max_steps=3,
+        memory_mode="summary",
+        verbose=False,
+    )
+    result = agent.run("Where did Van Gogh live?")
+    assert result.answer == "Van Gogh lived in Arles from 1888 to 1889."
+    print("[PASS] test_summary_memory_mode_works")
+
+
 if __name__ == "__main__":
     test_two_step_calculation()
     test_search_tool()
@@ -149,4 +196,6 @@ if __name__ == "__main__":
     test_reprompt_recovers_from_unparseable_output()
     test_reprompt_gives_up_after_the_retry_budget()
     test_parse_failure_counter_resets_on_a_good_turn()
+    test_compact_memory_keeps_prompt_short()
+    test_summary_memory_mode_works()
     print("\nAll tests passed.")

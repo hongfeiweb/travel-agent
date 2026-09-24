@@ -204,6 +204,9 @@ class ReActAgent:
         max_steps: int = 6,
         max_parse_retries: int = 2,
         verbose: bool = True,
+        memory_limit: int = 3,
+        recent_turns_limit: int = 2,
+        memory_mode: str = "summary",
     ):
         self.llm = llm
         self.tools = tools
@@ -214,13 +217,90 @@ class ReActAgent:
         # calls. 0 restores the old behaviour of bailing on first failure.
         self.max_parse_retries = max_parse_retries
         self.verbose = verbose
+        self.memory_limit = memory_limit
+        self.recent_turns_limit = recent_turns_limit
+        self.memory_mode = memory_mode.lower()
+        if self.memory_mode not in {"full", "compact", "summary"}:
+            raise ValueError("memory_mode must be one of: 'full', 'compact', 'summary'")
+
+    def _format_recent_turns(self, recent_turns: List[Dict[str, str]]) -> str:
+        if not recent_turns:
+            return "(no prior reasoning steps)"
+        compact = []
+        for turn in recent_turns[-self.recent_turns_limit:]:
+            role = turn["role"].title()
+            compact.append(f"{role}: {turn['content']}")
+        return "\n".join(compact)
+
+    def _summarize_memory(self, memory: str) -> str:
+        if not memory:
+            return "No facts gathered yet."
+        facts = [item.strip() for item in memory.split(" | ") if item.strip()]
+        if len(facts) <= self.memory_limit:
+            return "; ".join(facts)
+        return "; ".join(facts[-self.memory_limit:])
+
+    def _build_prompt_messages(self, question: str, memory: str, recent_turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if self.memory_mode == "full":
+            return [{"role": "user", "content": f"Question: {question}"}] + recent_turns
+
+        if self.memory_mode == "compact":
+            recent_text = self._format_recent_turns(recent_turns)
+            prompt = (
+                f"Question: {question}\n"
+                f"Memory: {self._summarize_memory(memory)}\n"
+                f"Recent steps:\n{recent_text}"
+            )
+            return [{"role": "user", "content": prompt}]
+
+        recent_text = self._format_recent_turns(recent_turns)
+        history_summary = self._summarize_old_history(recent_turns)
+        prompt = (
+            f"Question: {question}\n"
+            f"Memory: {self._summarize_memory(memory)}\n"
+            f"History summary: {history_summary}\n"
+            f"Recent steps:\n{recent_text}"
+        )
+        return [{"role": "user", "content": prompt}]
+
+    def _update_memory(self, memory: str, parsed: ParsedStep, observation: str) -> str:
+        if parsed.action_name == "Finish":
+            return memory
+        if parsed.action_name is None:
+            return memory
+
+        fact = f"{parsed.action_name}[{parsed.action_input}] -> {observation}"
+        facts = [item.strip() for item in memory.split(" | ") if item.strip()] if memory else []
+        facts.append(fact)
+        if len(facts) > self.memory_limit:
+            facts = facts[-self.memory_limit:]
+        return " | ".join(facts)
+
+    def _summarize_old_history(self, recent_turns: List[Dict[str, str]]) -> str:
+        if not recent_turns:
+            return "(no prior reasoning steps)"
+
+        summary_items = []
+        for turn in recent_turns:
+            content = turn["content"].strip()
+            if not content:
+                continue
+            summary_items.append(content)
+
+        if not summary_items:
+            return "(no prior reasoning steps)"
+        return " | ".join(summary_items[-self.recent_turns_limit * 2:])
 
     def run(self, question: str) -> ReActResult:
         messages = [{"role": "user", "content": f"Question: {question}"}]
+        recent_turns: List[Dict[str, str]] = []
+        memory = ""
         trace: List[TraceStep] = []
         consecutive_parse_failures = 0
 
         for step_num in range(1, self.max_steps + 1):
+            if self.memory_mode != "full":
+                messages = self._build_prompt_messages(question, memory, recent_turns)
             raw = self.llm(self.system_prompt, messages)
             parsed = parse_step(raw)
 
@@ -231,8 +311,10 @@ class ReActAgent:
                 if parsed.action_name:
                     print(f"Action: {parsed.action_name}[{parsed.action_input}]")
 
-            # The model's own turn goes into the transcript as-is.
-            messages.append({"role": "assistant", "content": raw})
+            if self.memory_mode != "full":
+                recent_turns.append({"role": "assistant", "content": raw})
+            else:
+                messages.append({"role": "assistant", "content": raw})
 
             if parsed.action_name is None:
                 # Model didn't follow the format. Tell it so and let it retry,
@@ -254,7 +336,12 @@ class ReActAgent:
                 if self.verbose:
                     print(f"Observation: {reprompt}")
                 trace.append(TraceStep(parsed.thought, None, None, reprompt))
-                messages.append({"role": "user", "content": reprompt})
+                if self.memory_mode != "full":
+                    recent_turns.append({"role": "user", "content": reprompt})
+                    if len(recent_turns) > self.recent_turns_limit * 3:
+                        recent_turns = recent_turns[-self.recent_turns_limit * 3:]
+                else:
+                    messages.append({"role": "user", "content": reprompt})
                 continue
 
             consecutive_parse_failures = 0
@@ -273,6 +360,12 @@ class ReActAgent:
                 print(f"Observation: {observation}")
 
             trace.append(TraceStep(parsed.thought, parsed.action_name, parsed.action_input, observation))
-            messages.append({"role": "user", "content": f"Observation: {observation}"})
+            if self.memory_mode != "full":
+                recent_turns.append({"role": "user", "content": f"Observation: {observation}"})
+                if len(recent_turns) > self.recent_turns_limit * 3:
+                    recent_turns = recent_turns[-self.recent_turns_limit * 3:]
+                memory = self._update_memory(memory, parsed, observation)
+            else:
+                messages.append({"role": "user", "content": f"Observation: {observation}"})
 
         return ReActResult(answer=None, trace=trace, hit_step_cap=True)
